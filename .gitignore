@@ -1,0 +1,8 @@
+experiments/
+logs/
+__pycache__/
+*.pyc
+.DS_Store
+*.weights.h5
+create_report.js
+REBAL_Sprint1_Report.docx
