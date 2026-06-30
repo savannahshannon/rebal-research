@@ -115,6 +115,17 @@ class Config:
     IMBALANCE_RATIO: float = 100.0     # ρ; used when IMBALANCE_PROTOCOL=="cui2019"
     DATASET: str = "cifar100"          # "cifar100" | "cifar10"
 
+    # Sprint 2.5: decouple cGAN seed, gate cGAN by per-class sample count,
+    # defer rebalancing terms, and stabilize training at extreme imbalance.
+    # All defaults below reproduce Sprint 1/2 behaviour exactly (no-op);
+    # they only activate via ENV vars / CLI flags or the resnet32 preset.
+    CGAN_SEED: int = 1234                  # independent of CFG.SEED
+    CGAN_MIN_REAL: int = 30                # skip cGAN samples for classes below this real-sample count
+    DEFER_REWEIGHTING_FRAC: float = 0.0    # fraction of CLS_EPOCHS before reweighting turns on (0 = always on)
+    DEFER_EQUALIZATION_FRAC: float = 0.0   # fraction of CLS_EPOCHS before equalization turns on (0 = always on)
+    WARMUP_EPOCHS: int = 0                 # linear LR warmup epochs before cosine decay (0 = no warmup)
+    USE_BALANCED_BATCH: bool = False       # class-uniform batch sampling instead of natural distribution
+
 
 CFG = Config()
 
@@ -129,6 +140,11 @@ if os.environ.get("REBAL_ARCH"):
     CFG.ARCHITECTURE = os.environ["REBAL_ARCH"]
     if CFG.ARCHITECTURE == "resnet32":
         CFG.CLS_EPOCHS = 200   # published training budget for ResNet-32 on CIFAR-LT
+        # Sprint 2.5 stability preset (Cao et al. 2019 DRW-style deferral).
+        # Individual ENV vars below can still override any of these.
+        CFG.WARMUP_EPOCHS = 10
+        CFG.DEFER_REWEIGHTING_FRAC = 0.8
+        CFG.DEFER_EQUALIZATION_FRAC = 0.8
 if os.environ.get("REBAL_DATASET"):
     CFG.DATASET = os.environ["REBAL_DATASET"]
     CFG.NUM_CLASSES = 10 if CFG.DATASET == "cifar10" else 100
@@ -142,6 +158,37 @@ if os.environ.get("REBAL_BASELINE_ONLY") == "1":
     CFG.USE_FEATURE_SMOTE = False
     CFG.USE_REWEIGHTING   = False
     CFG.USE_EQUALIZATION  = False
+
+# Sprint 2.5 ENV var overrides — explicit knobs for the calibration sweep
+# (warmup, LR, balanced batching) and the rho=100 module ablation grid.
+if os.environ.get("REBAL_CGAN_SEED"):
+    CFG.CGAN_SEED = int(os.environ["REBAL_CGAN_SEED"])
+if os.environ.get("REBAL_CGAN_MIN_REAL"):
+    CFG.CGAN_MIN_REAL = int(os.environ["REBAL_CGAN_MIN_REAL"])
+if os.environ.get("REBAL_WARMUP_EPOCHS"):
+    CFG.WARMUP_EPOCHS = int(os.environ["REBAL_WARMUP_EPOCHS"])
+if os.environ.get("REBAL_CLS_LR"):
+    CFG.CLS_LR = float(os.environ["REBAL_CLS_LR"])
+if os.environ.get("REBAL_BALANCED_BATCH") == "1":
+    CFG.USE_BALANCED_BATCH = True
+if os.environ.get("REBAL_DEFER_FRAC"):
+    _frac = float(os.environ["REBAL_DEFER_FRAC"])
+    CFG.DEFER_REWEIGHTING_FRAC = _frac
+    CFG.DEFER_EQUALIZATION_FRAC = _frac
+if os.environ.get("REBAL_ABLATE"):
+    _ablate = os.environ["REBAL_ABLATE"]
+    if _ablate == "cgan":
+        CFG.USE_CGAN_AUG = False
+    elif _ablate == "eq":
+        CFG.USE_EQUALIZATION = False
+    elif _ablate == "rw":
+        CFG.USE_REWEIGHTING = False
+    elif _ablate == "decoupled":
+        CFG.USE_CGAN_AUG     = False
+        CFG.USE_REWEIGHTING  = False
+        CFG.USE_EQUALIZATION = False
+        # USE_FEATURE_SMOTE stays True so the cRT step still runs
+        # (Kang et al. 2020 decoupled recipe: vanilla trunk + cRT head).
 
 
 def set_seeds(seed):
@@ -308,6 +355,13 @@ def build_discriminator():
 
 
 def train_cgan(x, y, epochs=CFG.GAN_EPOCHS):
+    # Sprint 2.5: the cGAN gets its own seed namespace, independent of
+    # CFG.SEED. Without this, every classifier seed inherits whatever
+    # noise the cGAN's initialization happened to produce, which couples
+    # classifier variance to generator variance and makes it impossible
+    # to tell which one is responsible for an unstable run.
+    _classifier_seed = CFG.SEED
+    tf.keras.utils.set_random_seed(CFG.CGAN_SEED)
     g, d = build_generator(), build_discriminator()
     bce = tf.keras.losses.BinaryCrossentropy()
     g_opt = tf.keras.optimizers.Adam(CFG.GAN_LR, beta_1=0.5)
@@ -338,15 +392,39 @@ def train_cgan(x, y, epochs=CFG.GAN_EPOCHS):
             gl += a; dl += b; n += 1
         print(f"  cGAN ep {ep+1:3d}/{epochs}  "
             f"g={gl/n:.3f}  d={dl/n:.3f}  ({time.time()-t0:.1f}s)")
+    tf.keras.utils.set_random_seed(_classifier_seed)   # restore classifier seed
     return g
 
 
-def sample_cgan(generator, per_class=CFG.CGAN_AUG_PER_CLASS):
-    """Generate `per_class` images for each of NUM_CLASSES."""
-    n = per_class * CFG.NUM_CLASSES
+def sample_cgan(generator, y_train_real, per_class=CFG.CGAN_AUG_PER_CLASS,
+                min_real_samples=None):
+    """Generate `per_class` images for each class with enough real support.
+
+    Sprint 2.5: at extreme imbalance (e.g. rho=100) tail classes can have
+    fewer than 10 real images. A cGAN trained on that few examples per
+    class produces low-quality, often label-confused samples; mixing those
+    into classifier training poisons the trunk rather than helping it.
+    Classes below `min_real_samples` real images are skipped entirely —
+    their representation increase comes from feature-space SMOTE instead,
+    where even a handful of real samples is enough to interpolate from.
+    """
+    if min_real_samples is None:
+        min_real_samples = CFG.CGAN_MIN_REAL
+    real_counts = Counter(y_train_real)
+    eligible = [c for c in range(CFG.NUM_CLASSES)
+                if real_counts.get(c, 0) >= min_real_samples]
+    if not eligible:
+        print(f"  cGAN gated: 0/{CFG.NUM_CLASSES} classes meet the "
+              f"{min_real_samples}-real-sample threshold — skipping cGAN augmentation")
+        return (np.zeros((0, *CFG.IMG_SHAPE), dtype="float32"),
+                np.zeros((0,), dtype="int32"))
+    n = per_class * len(eligible)
     z = tf.random.normal([n, CFG.LATENT_DIM])
-    lab = np.repeat(np.arange(CFG.NUM_CLASSES), per_class).astype(np.int32)
+    lab = np.repeat(eligible, per_class).astype(np.int32)
     imgs = generator.predict([z, lab], batch_size=512, verbose=0)
+    print(f"  cGAN gated: generated {n} images across "
+          f"{len(eligible)}/{CFG.NUM_CLASSES} classes "
+          f"(threshold = {min_real_samples} real samples)")
     return imgs, lab
 
 
@@ -514,11 +592,67 @@ def equalization_loss(features, labels, num_classes=CFG.NUM_CLASSES):
 # ======================================================================
 # 8. CUSTOM TRAINING LOOP  (visible enough that you can edit it)
 # ======================================================================
+class WarmupCosineDecay(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """Linear LR warmup for `warmup_steps`, then cosine decay to 0.
+
+    Sprint 2.5: at high imbalance ratios, starting straight at the peak
+    LR can destabilize BatchNorm running stats before the trunk has seen
+    enough of the (very few) tail-class examples. A short linear ramp-up
+    fixes this without changing the eventual peak LR or decay shape.
+    """
+    def __init__(self, peak_lr, warmup_steps, decay_steps):
+        super().__init__()
+        self.peak_lr = peak_lr
+        self.warmup_steps = max(1, warmup_steps)
+        self.cosine = tf.keras.optimizers.schedules.CosineDecay(
+            peak_lr, decay_steps=max(1, decay_steps))
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.float32)
+        warmup_lr = self.peak_lr * (step / tf.cast(self.warmup_steps, tf.float32))
+        decayed_lr = self.cosine(step - tf.cast(self.warmup_steps, tf.float32))
+        return tf.where(step < tf.cast(self.warmup_steps, tf.float32),
+                        warmup_lr, decayed_lr)
+
+    def get_config(self):
+        return {"peak_lr": self.peak_lr, "warmup_steps": self.warmup_steps}
+
+
+def _build_balanced_dataset(x_train, y_train):
+    """Class-uniform batch sampling: each batch draws every class with
+    equal probability, regardless of the natural (imbalanced) frequency.
+
+    Sprint 2.5: under heavy imbalance, natural-distribution batches at
+    rho=100 can go many steps without seeing a tail class at all, which
+    destabilizes BatchNorm running statistics. Sampling per-class datasets
+    uniformly keeps every class represented in (almost) every batch.
+    """
+    classes = np.unique(y_train)
+    per_class_ds = []
+    for c in classes:
+        idx_c = np.where(y_train == c)[0]
+        ds_c = (tf.data.Dataset.from_tensor_slices((x_train[idx_c], y_train[idx_c]))
+                .shuffle(len(idx_c), seed=CFG.SEED, reshuffle_each_iteration=True)
+                .repeat())
+        per_class_ds.append(ds_c)
+    balanced = tf.data.Dataset.sample_from_datasets(
+        per_class_ds, weights=[1.0 / len(classes)] * len(classes), seed=CFG.SEED)
+    steps_per_epoch = max(1, len(x_train) // CFG.BATCH_SIZE)
+    return (balanced.batch(CFG.BATCH_SIZE)
+            .take(steps_per_epoch)
+            .prefetch(tf.data.AUTOTUNE))
+
+
 def train_classifier(model, x_train, y_train, x_val, y_val, class_weights):
+    steps_per_epoch = max(1, len(x_train) // CFG.BATCH_SIZE)
     if CFG.USE_LR_SCHEDULE:
-        steps_per_epoch = max(1, len(x_train) // CFG.BATCH_SIZE)
-        lr = tf.keras.optimizers.schedules.CosineDecay(
-            CFG.CLS_LR, decay_steps=steps_per_epoch * CFG.CLS_EPOCHS)
+        decay_steps = steps_per_epoch * max(1, CFG.CLS_EPOCHS - CFG.WARMUP_EPOCHS)
+        if CFG.WARMUP_EPOCHS > 0:
+            lr = WarmupCosineDecay(CFG.CLS_LR, steps_per_epoch * CFG.WARMUP_EPOCHS,
+                                    decay_steps)
+        else:
+            lr = tf.keras.optimizers.schedules.CosineDecay(
+                CFG.CLS_LR, decay_steps=decay_steps)
     else:
         lr = CFG.CLS_LR
     opt = tf.keras.optimizers.SGD(lr, momentum=0.9, nesterov=True,
@@ -528,10 +662,20 @@ def train_classifier(model, x_train, y_train, x_val, y_val, class_weights):
         from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
     cw = tf.constant(class_weights, dtype=tf.float32)
 
-    ds = (tf.data.Dataset.from_tensor_slices((x_train, y_train))
-        .shuffle(min(20000, len(x_train)), seed=CFG.SEED)
-        .batch(CFG.BATCH_SIZE)
-        .prefetch(tf.data.AUTOTUNE))
+    # Sprint 2.5: deferred rebalancing (Cao et al. 2019 DRW). cur_epoch is a
+    # tf.Variable (not a Python int) so train_step reads it without
+    # retracing the @tf.function every epoch.
+    cur_epoch = tf.Variable(0, dtype=tf.int32, trainable=False)
+    defer_rw_epoch = int(CFG.DEFER_REWEIGHTING_FRAC * CFG.CLS_EPOCHS)
+    defer_eq_epoch = int(CFG.DEFER_EQUALIZATION_FRAC * CFG.CLS_EPOCHS)
+
+    if CFG.USE_BALANCED_BATCH:
+        ds = _build_balanced_dataset(x_train, y_train)
+    else:
+        ds = (tf.data.Dataset.from_tensor_slices((x_train, y_train))
+            .shuffle(min(20000, len(x_train)), seed=CFG.SEED)
+            .batch(CFG.BATCH_SIZE)
+            .prefetch(tf.data.AUTOTUNE))
 
     @tf.function
     def train_step(xb, yb):
@@ -539,13 +683,15 @@ def train_classifier(model, x_train, y_train, x_val, y_val, class_weights):
             logits, feats = model(xb, training=True)
             per_sample = ce(yb, logits)
             if CFG.USE_REWEIGHTING:
-                sample_w = tf.gather(cw, yb)
+                use_w = tf.cast(cur_epoch >= defer_rw_epoch, tf.float32)
+                sample_w = use_w * tf.gather(cw, yb) + (1.0 - use_w)
                 cls_loss = tf.reduce_mean(per_sample * sample_w)
             else:
                 cls_loss = tf.reduce_mean(per_sample)
             loss = cls_loss
             if CFG.USE_EQUALIZATION:
-                loss = loss + CFG.LAMBDA_EQ * equalization_loss(feats, yb)
+                use_eq = tf.cast(cur_epoch >= defer_eq_epoch, tf.float32)
+                loss = loss + use_eq * CFG.LAMBDA_EQ * equalization_loss(feats, yb)
             loss = loss + tf.add_n([tf.cast(l, loss.dtype)
                                     for l in model.losses]) if model.losses else loss
         grads = tape.gradient(loss, model.trainable_variables)
@@ -554,8 +700,13 @@ def train_classifier(model, x_train, y_train, x_val, y_val, class_weights):
         opt.apply_gradients(zip(grads, model.trainable_variables))
         return loss, cls_loss
 
+    if defer_rw_epoch > 0 or defer_eq_epoch > 0:
+        print(f"  deferred rebalancing: reweighting@{defer_rw_epoch} "
+              f"equalization@{defer_eq_epoch} (of {CFG.CLS_EPOCHS} epochs)")
+
     best_val, best_w, patience = -1.0, None, 0
     for ep in range(CFG.CLS_EPOCHS):
+        cur_epoch.assign(ep)
         t0 = time.time(); tl = tcl = 0.0; n = 0
         for xb, yb in ds:
             l, cl = train_step(xb, yb)
@@ -641,7 +792,13 @@ def main(seed=None):
     print(f"\n{'=' * 60}\nSeed: {CFG.SEED}  arch={CFG.ARCHITECTURE}  "
           f"protocol={CFG.IMBALANCE_PROTOCOL}"
           + (f"  rho={CFG.IMBALANCE_RATIO}" if CFG.IMBALANCE_PROTOCOL == "cui2019" else "")
-          + f"  dataset={CFG.DATASET}\n{'=' * 60}")
+          + f"  dataset={CFG.DATASET}\n"
+          + f"modules: cgan={CFG.USE_CGAN_AUG} rw={CFG.USE_REWEIGHTING} "
+          + f"eq={CFG.USE_EQUALIZATION} smote={CFG.USE_FEATURE_SMOTE}\n"
+          + f"sprint2.5: cgan_seed={CFG.CGAN_SEED} cgan_min_real={CFG.CGAN_MIN_REAL} "
+          + f"warmup={CFG.WARMUP_EPOCHS} defer_rw={CFG.DEFER_REWEIGHTING_FRAC} "
+          + f"defer_eq={CFG.DEFER_EQUALIZATION_FRAC} balanced_batch={CFG.USE_BALANCED_BATCH}"
+          + f"\n{'=' * 60}")
     t_start = time.time()
 
     _out_override = os.environ.get("REBAL_OUT_DIR")
@@ -681,8 +838,9 @@ def main(seed=None):
         print("\nTraining cGAN on cleaned (imbalanced) data...")
         gen = train_cgan(x_clean, y_clean)   # needs [-1,1] data
         del x_clean; gc.collect()            # free [-1,1] copy after GAN is trained
-        print(f"\nGenerating {CFG.CGAN_AUG_PER_CLASS} cGAN samples per class...")
-        gan_x, gan_y = sample_cgan(gen)
+        print(f"\nGenerating {CFG.CGAN_AUG_PER_CLASS} cGAN samples per class "
+              f"(gated at >= {CFG.CGAN_MIN_REAL} real samples)...")
+        gan_x, gan_y = sample_cgan(gen, y_clean)
         del gen; gc.collect()                # generator weights no longer needed
         gan_x_01 = np.clip((gan_x + 1.0) / 2.0, 0.0, 1.0)
         del gan_x; gc.collect()
@@ -827,6 +985,23 @@ def main(seed=None):
     results = {
         "seed": CFG.SEED,
         "runtime_sec": runtime_sec,
+        "config": {
+            "architecture": CFG.ARCHITECTURE,
+            "imbalance_protocol": CFG.IMBALANCE_PROTOCOL,
+            "rho": CFG.IMBALANCE_RATIO if CFG.IMBALANCE_PROTOCOL == "cui2019" else None,
+            "dataset": CFG.DATASET,
+            "use_cgan_aug": CFG.USE_CGAN_AUG,
+            "use_reweighting": CFG.USE_REWEIGHTING,
+            "use_equalization": CFG.USE_EQUALIZATION,
+            "use_feature_smote": CFG.USE_FEATURE_SMOTE,
+            "cgan_seed": CFG.CGAN_SEED,
+            "cgan_min_real": CFG.CGAN_MIN_REAL,
+            "warmup_epochs": CFG.WARMUP_EPOCHS,
+            "defer_reweighting_frac": CFG.DEFER_REWEIGHTING_FRAC,
+            "defer_equalization_frac": CFG.DEFER_EQUALIZATION_FRAC,
+            "balanced_batch": CFG.USE_BALANCED_BATCH,
+            "cls_lr": CFG.CLS_LR,
+        },
         "baseline": _scalarize(base_metrics),
         "rebal": _scalarize(final_metrics),
     }
@@ -886,6 +1061,20 @@ if __name__ == "__main__":
                         help="disable all REBAL modules (baseline cross-entropy only)")
     parser.add_argument("--out-dir", type=str, default=None,
                         help="output directory for artifacts (overrides EXPERIMENT_ROOT)")
+    # Sprint 2.5 flags
+    parser.add_argument("--ablate", type=str, default=None,
+                        choices=["cgan", "eq", "rw", "decoupled"],
+                        help="ablate a single REBAL module (rho=100 ablation grid)")
+    parser.add_argument("--cgan-seed", type=int, default=None,
+                        help="independent seed for cGAN init/training (default: 1234)")
+    parser.add_argument("--cgan-min-real", type=int, default=None,
+                        help="skip cGAN samples for classes with fewer real images than this")
+    parser.add_argument("--warmup-epochs", type=int, default=None,
+                        help="linear LR warmup epochs before cosine decay")
+    parser.add_argument("--defer-frac", type=float, default=None,
+                        help="fraction of CLS_EPOCHS before reweighting/equalization activate")
+    parser.add_argument("--balanced-batch", action="store_true",
+                        help="class-uniform batch sampling instead of natural distribution")
     args = parser.parse_args()
 
     # Apply Sprint 2 CLI overrides (ENV vars already applied at module load)
@@ -906,6 +1095,28 @@ if __name__ == "__main__":
         CFG.USE_EQUALIZATION  = False
     if args.out_dir is not None:
         os.environ["REBAL_OUT_DIR"] = args.out_dir
+    if args.ablate is not None:
+        if args.ablate == "cgan":
+            CFG.USE_CGAN_AUG = False
+        elif args.ablate == "eq":
+            CFG.USE_EQUALIZATION = False
+        elif args.ablate == "rw":
+            CFG.USE_REWEIGHTING = False
+        elif args.ablate == "decoupled":
+            CFG.USE_CGAN_AUG = False
+            CFG.USE_REWEIGHTING = False
+            CFG.USE_EQUALIZATION = False
+    if args.cgan_seed is not None:
+        CFG.CGAN_SEED = args.cgan_seed
+    if args.cgan_min_real is not None:
+        CFG.CGAN_MIN_REAL = args.cgan_min_real
+    if args.warmup_epochs is not None:
+        CFG.WARMUP_EPOCHS = args.warmup_epochs
+    if args.defer_frac is not None:
+        CFG.DEFER_REWEIGHTING_FRAC = args.defer_frac
+        CFG.DEFER_EQUALIZATION_FRAC = args.defer_frac
+    if args.balanced_batch:
+        CFG.USE_BALANCED_BATCH = True
 
     results = main(args.seed)
 

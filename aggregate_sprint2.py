@@ -52,13 +52,33 @@ def load_grid():
 
 # ── per-rho table ─────────────────────────────────────────────────────────────
 
+def bootstrap_ci(vals, n_boot=1000, seed=0):
+    """Percentile bootstrap 95% CI on the mean. Returns (lo, hi).
+
+    More honest than mean±std for n=5 seeds: doesn't assume normality and
+    isn't dominated by a single outlier seed the way std can be.
+    """
+    a = np.array(vals, dtype="float64")
+    if len(a) < 2:
+        v = float(a[0]) if len(a) else float("nan")
+        return v, v
+    rng = np.random.default_rng(seed)
+    boot_means = np.array([
+        rng.choice(a, size=len(a), replace=True).mean()
+        for _ in range(n_boot)
+    ])
+    lo, hi = np.percentile(boot_means, [2.5, 97.5])
+    return float(lo), float(hi)
+
+
 def _ms(vals):
-    """Return (mean, std, median) over a list of floats."""
+    """Return (mean, std, median, ci_lo, ci_hi) over a list of floats."""
     a = np.array(vals, dtype="float64")
     mean   = a.mean()
     std    = a.std(ddof=1) if len(a) > 1 else 0.0
     median = np.median(a)
-    return mean, std, median
+    ci_lo, ci_hi = bootstrap_ci(vals)
+    return mean, std, median, ci_lo, ci_hi
 
 
 def write_rho_table(grid, rho, path):
@@ -67,7 +87,10 @@ def write_rho_table(grid, rho, path):
         print(f"  no data for ρ={rho}, skipping.")
         return
 
-    header = (["config", "metric", "mean", "std", "median", "n_seeds"]
+    # median + bootstrap 95% CI are the primary reportable numbers (more
+    # honest than mean±std at n=5 seeds); mean/std kept for completeness.
+    header = (["config", "metric", "median", "ci_lo", "ci_hi",
+               "mean", "std", "n_seeds"]
               + [f"seed_{s}" for s in seeds])
     rows = [header]
 
@@ -91,9 +114,10 @@ def write_rho_table(grid, rho, path):
             v_list = [vals_by_seed[s][key] for s in seeds if s in vals_by_seed]
             if not v_list:
                 continue
-            mean, std, median = _ms(v_list)
+            mean, std, median, ci_lo, ci_hi = _ms(v_list)
             row = [label, METRIC_LABELS[key],
-                   f"{mean:.4f}", f"{std:.4f}", f"{median:.4f}", str(len(v_list))]
+                   f"{median:.4f}", f"{ci_lo:.4f}", f"{ci_hi:.4f}",
+                   f"{mean:.4f}", f"{std:.4f}", str(len(v_list))]
             for s in seeds:
                 row.append(f"{vals_by_seed[s][key]:.4f}" if s in vals_by_seed else "")
             rows.append(row)
