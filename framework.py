@@ -145,6 +145,10 @@ if os.environ.get("REBAL_ARCH"):
         CFG.WARMUP_EPOCHS = 10
         CFG.DEFER_REWEIGHTING_FRAC = 0.8
         CFG.DEFER_EQUALIZATION_FRAC = 0.8
+        # At rho=100, val_acc swings ±5-8pp per epoch during the middle
+        # training phase. Patience=12 (Sprint 1 default) fires too early,
+        # stopping seeds 40-130 epochs before they would have converged.
+        CFG.EARLY_STOP_PATIENCE = 40
 if os.environ.get("REBAL_DATASET"):
     CFG.DATASET = os.environ["REBAL_DATASET"]
     CFG.NUM_CLASSES = 10 if CFG.DATASET == "cifar10" else 100
@@ -161,6 +165,8 @@ if os.environ.get("REBAL_BASELINE_ONLY") == "1":
 
 # Sprint 2.5 ENV var overrides — explicit knobs for the calibration sweep
 # (warmup, LR, balanced batching) and the rho=100 module ablation grid.
+if os.environ.get("REBAL_EARLY_STOP_PATIENCE"):
+    CFG.EARLY_STOP_PATIENCE = int(os.environ["REBAL_EARLY_STOP_PATIENCE"])
 if os.environ.get("REBAL_CGAN_SEED"):
     CFG.CGAN_SEED = int(os.environ["REBAL_CGAN_SEED"])
 if os.environ.get("REBAL_CGAN_MIN_REAL"):
